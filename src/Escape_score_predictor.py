@@ -50,6 +50,7 @@ MODEL_LSTM_OUTPUT_GISAID_FEATURE_SAVE_PATH = FEATURE_EXTRACTION_SRC_PATH + "/mod
 MODEL_LSTM_OUTPUT_GREANY_FEATURE_SAVE_PATH = FEATURE_EXTRACTION_SRC_PATH + "/model_lstm_output_greany_features.npz"
 
 from Bio import SeqIO
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, matthews_corrcoef
 
 '''
 lengths : array containing sequence length for individual sequence [1152, 1205, ..., 1425]
@@ -169,6 +170,20 @@ def get_features(windowed_file):
     print("Reduced feature Shape after average: ", y_embed_output.shape)
     return y_embed_output
 
+def get_features_for_seqs(seqs):
+    '''
+    Computes features directly based on the sequence list 
+    Returns : Learned features array
+    '''
+    model =load_fz_model()
+    X_cat, lengths = featurize_seqs(seqs)
+    y_embed_output = model.transform(X_cat, lengths )
+    print("Shape of output previously: ", y_embed_output.shape) #  (rows, 22, 512)
+    #Reducing the feature taking the avarage from middle axis
+    y_embed_output = np.average(y_embed_output, axis=1)
+    print("Reduced feature Shape after average: ", y_embed_output.shape)
+    return y_embed_output
+
 def get_single_feature(input_window):
     model =load_fz_model()
     seqs = [input_window]
@@ -254,8 +269,8 @@ def get_dense_model():
 def analyze_greany():
     model = m.load_model(DISCRIMINATOR_LEARNING_MODEL_PATH)
     model.summary()
-    sig_data = get_features("data/additional_escape_variants/gen/greany_sig_combined_windowed_seqs.csv")
-    non_sig_data =  get_features("data/additional_escape_variants/gen/greany_non_sig_combined_windowed_seqs.csv")
+    sig_data = get_features("data/test/greany_sig_combined_windowed_seqs.csv")
+    non_sig_data =  get_features("data/test/greany_non_sig_combined_windowed_seqs.csv")
 
     sig_len =  len(sig_data)
     sig_features_output = np.ones( (sig_len, 1) )
@@ -284,8 +299,8 @@ def analyze_greany():
 
 def evaluate_baum():
     model = m.load_model(DISCRIMINATOR_LEARNING_MODEL_PATH)
-    sig_data = get_features("data/additional_escape_variants/gen/baum_sig_combined_windowed_seqs.csv")
-    non_sig_data = get_features("data/additional_escape_variants/gen/baum_non_sig_combined_windowed_seqs.csv")
+    sig_data = get_features("../data/test/baum_sig_combined_windowed_seqs.csv")
+    non_sig_data = get_features("../data/test/baum_non_sig_combined_windowed_seqs.csv")
 
     sig_len =  len(sig_data)
     sig_features_output = np.ones( (sig_len, 1) )
@@ -323,6 +338,104 @@ def plot_integrated_auc():
     result_table.set_index('dataset', inplace=True)
     plot_and_save_fig(result_table)
 
+def extra_metrics(y_true, y_pred):
+    #Convert y_true alos in int, as the default values are in float 
+    y_true  =   [int(y) for y in y_true]
+    
+    #y_pred is continous probability value beween 0 to 1, 
+    # we need to convert to binary prediction, before computing confusion matrix 
+    y_pred = [1 if y>= 0.5 else 0 for y in y_pred]
+    
+    #raveling or unrolling multidimnsion array into 1 d
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel() 
+    
+    #how many of the predicted positive  are actually positive
+    precision = tp/(tp+fp) if (tp+fp) > 0 else 0 
+    
+    #how many actual positive are correctly classified |sensitivity (TPR)
+    recall = tp/(tp+ fn) if (tp+fn) >0 else 0 
+    
+    #Specificity (True Negative rate)
+    specificity = tn/(tn+fp) if (tn+fp) >0 else 0
+    
+    f1 = f1_score(y_true, y_pred) # 2 * (prec * recall)/(prec + recall)
+    
+    #MCC (Matthews Correlation Coefficient)
+    #mcc: [(tp*tn) - (fp*fn)] / [SqareRoot{(TP+FP)(TP+FN)(TN+FP)(TN+FN) }]
+    mcc = matthews_corrcoef(y_true, y_pred)
+    
+    return {
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "f1" : f1,
+        "mcc" : mcc
+    }
+     
+     
+def compute_additional_metrics(model_base_path):
+    '''
+    This method computes additional performance metrices such as F1 Score MCC etc.
+    and Saves to the Json file. 
+    Parameters:
+    ----------
+    model_base_path : A base path where model and different stats are stored.
+    
+    
+    
+    '''
+    SEP = os.path.sep
+    input_dict = {
+        'VAL': model_base_path+SEP+'val_preds.csv',
+        'BAUM': model_base_path+SEP+'baum_preds.csv',
+        'GREANEY': model_base_path+SEP+'greany_preds.csv'
+        
+    }
+    #extract the basename as well for example: /model/m3 -->Extract m3 
+    BASE_NAME = os.path.basename(model_base_path)
+    save_path = model_base_path + SEP+ BASE_NAME +'_extra_metrics.json'
+    
+    import json
+    v_true, v_pred = read_scores(input_dict['VAL']) #analyze_validation_dataset()
+    b_true, b_pred = read_scores(input_dict['BAUM']) #evaluate_baum()
+    g_true, g_pred = read_scores(input_dict['GREANEY']) #analyze_greany()
+    
+    val_scores = extra_metrics(v_true, v_pred)
+    baum_scores  = extra_metrics(b_true, b_pred)
+    greaney_scores = extra_metrics(g_true, g_pred)
+    
+    scores = {
+        'Validation': val_scores,
+        'Baum': baum_scores,
+        'Greaney': greaney_scores
+    }
+    with open(save_path, 'w') as f:
+        json.dump(scores, f, indent=4) #indent 4 makes it more readable 
+    
+    print(f'Additional Metrices are sucessfully saved to {save_path} file successfully.')
+    
+
+def read_scores(csv_file_path):
+    '''
+    Reads True label and Predicted Labels from the CSV file 
+    
+    Parameters:
+    -----------
+    csv_file_path: File Path of CSV file that contains the True and Predicted Labels
+    
+    Returns: 
+    --------
+    True Labels list, and Predicted label List
+    '''
+    print(f'Reading True and Predicted Labels from Path: {csv_file_path}')
+    df = pd.read_csv(csv_file_path)
+    print('Total Records: ',len(df))
+    y_true = df['target'].to_list()
+    y_pred = df['predicted'].to_list()
+
+    assert len(y_true), len(y_pred)
+    return y_true, y_pred
+  
     
 
 def plot_and_save_fig(result_table):
@@ -547,7 +660,16 @@ def is_single_res_mutant(mutant):
         exit("Please provide valid single residue mutant eg: (D512K) ! Network does not support multiple residue mutant !! ")
         return False
 
-
+def compute_all_models_extra_scores():
+    ARCH_BASE = '/home/perm/sars_escape_netv2/data/model_results_archive'
+    compute_additional_metrics(ARCH_BASE+'/M1')
+    compute_additional_metrics(ARCH_BASE+'/M2')
+    compute_additional_metrics(ARCH_BASE+'/M3')
+    compute_additional_metrics(ARCH_BASE+'/M4')
+    compute_additional_metrics(ARCH_BASE+'/M5')
+    compute_additional_metrics(ARCH_BASE+'/M6')
+    #Additiona metric for old model SEN
+    compute_additional_metrics('/home/perm/sars_escape_netv2/model/Sen_old_model')
 
 if __name__ == "__main__":
     '''seqs_train =  ASE.read_window_file('data/gen/windowed_embed_train_seqs_35527.csv')
@@ -572,7 +694,7 @@ if __name__ == "__main__":
     #analyze_validation_dataset()
     #plot_integrated_auc()
     #exit()
-    analyze_greany()
+    #analyze_greany()
     '''args = parse_args()
     if args.predict.strip() == 'greaney':
         analyze_greany()
@@ -598,6 +720,12 @@ if __name__ == "__main__":
         print("Please provide valid options: greaney | validation")
 
     pass'''
+    
+    #compute_additional_metrics('../model/M3')
+    compute_additional_metrics('/home/perm/sars_escape_netv2/model/Sen_old_model')
+    # compute_all_models_extra_scores()
+
+    
 
 
 
